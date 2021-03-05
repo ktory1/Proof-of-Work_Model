@@ -1,0 +1,7 @@
+{
+	"WorkerID": "worker1",
+	"ListenAddr": "PASS VIA COMMAND-LINE",
+	"CoordAddr": ":28973",
+	"TracerServerAddr": ":19301",
+	"TracerSecret": ""
+}
