@@ -1,6 +1,6 @@
 {
-  "ClientID": "client2",
-  "CoordAddr": ":35526",
-  "TracerServerAddr": ":19301",
-  "TracerSecret": ""
+	"ClientID": "client2",
+	"CoordAddr": ":25635",
+	"TracerServerAddr": ":24264",
+	"TracerSecret": ""
 }

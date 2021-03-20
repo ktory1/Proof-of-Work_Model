@@ -23,20 +23,20 @@ type PowlibMine struct {
 type PowlibSuccess struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
-	Secret           []uint8
+	Secret           string
 }
 
 type PowlibMiningComplete struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
-	Secret           []uint8
+	Secret           string
 }
 
 // MineResult contains the result of a mining request.
 type MineResult struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
-	Secret           []uint8
+	Secret           string
 }
 
 // NotifyChannel is used for notifying the client about a mining result.
@@ -51,6 +51,18 @@ type POW struct {
 	notifyCh    NotifyChannel
 	closeCh     CloseChannel
 	closeWg     *sync.WaitGroup
+}
+
+// PowlibMineResult contains the result of a mining request and the token
+type PowlibMineResult struct {
+	MineRes  MineResult
+	RetToken tracing.TracingToken
+}
+
+// POWLibMineArgs is used to pass arguments to Coordinator.Mine through RPC call
+type PowlibMineArgs struct {
+	MineArgs PowlibMine
+	Token    tracing.TracingToken
 }
 
 func NewPOW() *POW {
@@ -68,7 +80,7 @@ func NewPOW() *POW {
 // an appropriate err value, otherwise err should be set to nil.
 func (d *POW) Initialize(coordAddr string, chCapacity uint) (NotifyChannel, error) {
 	// connect to Coordinator
-	log.Printf("dailing coordinator at %s", coordAddr)
+	log.Printf("dialing coordinator at %s", coordAddr)
 	coordinator, err := rpc.Dial("tcp", coordAddr)
 	if err != nil {
 		return nil, fmt.Errorf("error dialing coordinator: %s", err)
@@ -93,12 +105,13 @@ func (d *POW) Initialize(coordAddr string, chCapacity uint) (NotifyChannel, erro
 // puzzle must be delivered asynchronously to the client via the notify-channel
 // channel returned in the Initialize call.
 func (d *POW) Mine(tracer *tracing.Tracer, nonce []uint8, numTrailingZeros uint) error {
-	tracer.RecordAction(PowlibMiningBegin{
+	trace := tracer.CreateTrace()
+	trace.RecordAction(PowlibMiningBegin{
 		Nonce:            nonce,
 		NumTrailingZeros: numTrailingZeros,
 	})
 	d.closeWg.Add(1)
-	go d.callMine(tracer, nonce, numTrailingZeros)
+	go d.callMine(tracer, trace, nonce, numTrailingZeros)
 	return nil
 }
 
@@ -124,19 +137,23 @@ func (d *POW) Close() error {
 	return nil
 }
 
-func (d *POW) callMine(tracer *tracing.Tracer, nonce []uint8, numTrailingZeros uint) {
+func (d *POW) callMine(tracer *tracing.Tracer, trace *tracing.Trace, nonce []uint8, numTrailingZeros uint) {
 	defer func() {
 		log.Printf("callMine done")
 		d.closeWg.Done()
 	}()
 
-	args := PowlibMine{
+	mineArgs := PowlibMine{
 		Nonce:            nonce,
 		NumTrailingZeros: numTrailingZeros,
 	}
-	tracer.RecordAction(args)
+	trace.RecordAction(mineArgs)
+	args := PowlibMineArgs{
+		MineArgs: mineArgs,
+		Token:    trace.GenerateToken(),
+	}
 
-	result := MineResult{}
+	result := PowlibMineResult{}
 	call := d.coordinator.Go("CoordRPCHandler.Mine", args, &result, nil)
 	for {
 		select {
@@ -144,17 +161,18 @@ func (d *POW) callMine(tracer *tracing.Tracer, nonce []uint8, numTrailingZeros u
 			if call.Error != nil {
 				log.Fatal(call.Error)
 			} else {
-				tracer.RecordAction(PowlibSuccess{
-					Nonce:            result.Nonce,
-					NumTrailingZeros: result.NumTrailingZeros,
-					Secret:           result.Secret,
+				trace := tracer.ReceiveToken(result.RetToken)
+				trace.RecordAction(PowlibSuccess{
+					Nonce:            result.MineRes.Nonce,
+					NumTrailingZeros: result.MineRes.NumTrailingZeros,
+					Secret:           result.MineRes.Secret,
 				})
-				tracer.RecordAction(PowlibMiningComplete{
-					Nonce:            result.Nonce,
-					NumTrailingZeros: result.NumTrailingZeros,
-					Secret:           result.Secret,
+				trace.RecordAction(PowlibMiningComplete{
+					Nonce:            result.MineRes.Nonce,
+					NumTrailingZeros: result.MineRes.NumTrailingZeros,
+					Secret:           result.MineRes.Secret,
 				})
-				d.notifyCh <- result
+				d.notifyCh <- result.MineRes
 			}
 			return
 		case <-d.closeCh:

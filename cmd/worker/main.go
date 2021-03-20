@@ -26,10 +26,11 @@ func main() {
 
 	for res := range worker.ResultChannel {
 		result := distpow.CoordResultArgs{
-			Nonce:            res.Nonce,
-			NumTrailingZeros: res.NumTrailingZeros,
-			WorkerByte:       res.WorkerByte,
-			Secret:           res.Secret,
+			Nonce:            res.Result.Nonce,
+			NumTrailingZeros: res.Result.NumTrailingZeros,
+			WorkerByte:       res.Result.WorkerByte,
+			Secret:           res.Result.Secret,
+			RetToken:         res.RetToken,
 		}
 		worker.Coordinator.Go("CoordRPCHandler.Result", result, &struct{}{}, nil)
 	}

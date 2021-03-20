@@ -1,12 +1,12 @@
 {
-	"ClientAPIListenAddr": ":35526",
-	"WorkerAPIListenAddr": ":28973",
+	"ClientAPIListenAddr": ":25635",
+	"WorkerAPIListenAddr": ":34763",
 	"Workers": [
-		":10152",
-		":9821",
-		":15406",
-		":26222"
+		":24610",
+		":29751",
+		":21479",
+		":32970"
 	],
-	"TracerServerAddr": ":19301",
+	"TracerServerAddr": ":24264",
 	"TracerSecret": ""
 }

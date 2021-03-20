@@ -1,5 +1,6 @@
 {
-	"ServerBind": ":19301",
+	"ServerBind": ":24264",
 	"Secret": "",
-	"OutputFile": "trace_output.log"
+	"OutputFile": "trace_output.log",
+	"ShivizOutputFile": "shiviz_output.log"
 }

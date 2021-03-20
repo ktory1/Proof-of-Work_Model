@@ -79,6 +79,12 @@ func main() {
 		clientConfig.CoordAddr = coordinatorClientListenAddr
 	})
 
+	client2Config := &distpow.ClientConfig{}
+	updateConfig("client2_config.json", client2Config, func() {
+		client2Config.TracerServerAddr = traceServerAddr
+		client2Config.CoordAddr = coordinatorClientListenAddr
+	})
+
 	workerConfig := &distpow.WorkerConfig{}
 	updateConfig("worker_config.json", workerConfig, func() {
 		workerConfig.TracerServerAddr = traceServerAddr

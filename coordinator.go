@@ -43,7 +43,7 @@ type CoordinatorWorkerResult struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
 	WorkerByte       uint8
-	Secret           []uint8
+	Secret           string
 }
 
 type CoordinatorWorkerCancel struct {
@@ -55,7 +55,7 @@ type CoordinatorWorkerCancel struct {
 type CoordinatorSuccess struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
-	Secret           []uint8
+	Secret           string
 }
 
 type Coordinator struct {
@@ -65,22 +65,27 @@ type Coordinator struct {
 }
 
 /****** RPC structs ******/
-type CoordMineArgs struct {
+type MineArgs struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
 }
 
+type CoordMineArgs struct {
+	MineArgs MineArgs
+	Token    tracing.TracingToken
+}
+
 type CoordMineResponse struct {
-	Nonce            []uint8
-	NumTrailingZeros uint
-	Secret           []uint8
+	MineRes  CoordinatorSuccess
+	RetToken tracing.TracingToken
 }
 
 type CoordResultArgs struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
 	WorkerByte       uint8
-	Secret           []uint8
+	Secret           string
+	RetToken         tracing.TracingToken
 }
 
 type ResultChan chan CoordResultArgs
@@ -122,10 +127,10 @@ func NewCoordinator(config CoordinatorConfig) *Coordinator {
 
 // Mine is a blocking RPC from powlib instructing the Coordinator to solve a specific pow instance
 func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) error {
-
-	c.tracer.RecordAction(CoordinatorMine{
-		NumTrailingZeros: args.NumTrailingZeros,
-		Nonce:            args.Nonce,
+	trace := c.tracer.ReceiveToken(args.Token)
+	trace.RecordAction(CoordinatorMine{
+		NumTrailingZeros: args.MineArgs.NumTrailingZeros,
+		Nonce:            args.MineArgs.Nonce,
 	})
 
 	// initialize and connect to workers (if not already connected)
@@ -137,23 +142,26 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 	workerCount := len(c.workers)
 
 	resultChan := make(chan CoordResultArgs, workerCount)
-	c.mineTasks.set(args.Nonce, args.NumTrailingZeros, resultChan)
+	c.mineTasks.set(args.MineArgs.Nonce, args.MineArgs.NumTrailingZeros, resultChan)
 
 	for _, w := range c.workers {
 		args := WorkerMineArgs{
-			Nonce:            args.Nonce,
-			NumTrailingZeros: args.NumTrailingZeros,
+			Nonce:            args.MineArgs.Nonce,
+			NumTrailingZeros: args.MineArgs.NumTrailingZeros,
 			WorkerByte:       w.workerByte,
 			WorkerBits:       c.workerBits,
+			Token:            trace.GenerateToken(),
 		}
 
-		c.tracer.RecordAction(CoordinatorWorkerMine{
+		reply := WorkerReply{}
+
+		trace.RecordAction(CoordinatorWorkerMine{
 			Nonce:            args.Nonce,
 			NumTrailingZeros: args.NumTrailingZeros,
 			WorkerByte:       args.WorkerByte,
 		})
 
-		err := w.client.Call("WorkerRPCHandler.Mine", args, &struct{}{})
+		err := w.client.Call("WorkerRPCHandler.Mine", args, &reply)
 		if err != nil {
 			return err
 		}
@@ -162,24 +170,27 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 	// wait for at least one result
 	result := <-resultChan
 	// sanity check
-	if result.Secret == nil {
+	if result.Secret == "" {
 		log.Fatalf("First worker result appears to be cancellation ACK, from workerByte = %d", result.WorkerByte)
 	}
 
 	// after receiving one result, cancel all workers unconditionally.
 	// the cancellation takes place of an ACK for any workers sending results.
 	for _, w := range c.workers {
-		args := WorkerCancelArgs{
-			Nonce:            args.Nonce,
-			NumTrailingZeros: args.NumTrailingZeros,
-			WorkerByte:       w.workerByte,
+		if w.workerByte != result.WorkerByte {
+			trace.RecordAction(CoordinatorWorkerCancel{
+				Nonce:            args.MineArgs.Nonce,
+				NumTrailingZeros: args.MineArgs.NumTrailingZeros,
+				WorkerByte:       w.workerByte,
+			})
 		}
-		c.tracer.RecordAction(CoordinatorWorkerCancel{
-			Nonce:            args.Nonce,
-			NumTrailingZeros: args.NumTrailingZeros,
-			WorkerByte:       args.WorkerByte,
-		})
-		err := w.client.Call("WorkerRPCHandler.Cancel", args, &struct{}{})
+		args := WorkerCancelArgs{
+			Nonce:            args.MineArgs.Nonce,
+			NumTrailingZeros: args.MineArgs.NumTrailingZeros,
+			WorkerByte:       w.workerByte,
+			Token:            trace.GenerateToken(),
+		}
+		err := w.client.Call("WorkerRPCHandler.Found", args, &struct{}{})
 		if err != nil {
 			return err
 		}
@@ -192,7 +203,7 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 	workerAcksReceived := 0
 	for workerAcksReceived < workerCount {
 		ack := <-resultChan
-		if ack.Secret == nil {
+		if ack.Secret == "" {
 			log.Printf("Counting toward acks: %v", ack)
 			workerAcksReceived += 1
 		} else {
@@ -201,25 +212,24 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 	}
 
 	// delete completed mine task from map
-	c.mineTasks.delete(args.Nonce, args.NumTrailingZeros)
+	c.mineTasks.delete(args.MineArgs.Nonce, args.MineArgs.NumTrailingZeros)
 
-	reply.NumTrailingZeros = result.NumTrailingZeros
-	reply.Nonce = result.Nonce
-	reply.Secret = result.Secret
+	reply.MineRes.NumTrailingZeros = result.NumTrailingZeros
+	reply.MineRes.Nonce = result.Nonce
+	reply.MineRes.Secret = result.Secret
 
-	c.tracer.RecordAction(CoordinatorSuccess{
-		Nonce:            reply.Nonce,
-		NumTrailingZeros: reply.NumTrailingZeros,
-		Secret:           reply.Secret,
-	})
+	trace.RecordAction(reply.MineRes)
+
+	reply.RetToken = trace.GenerateToken()
 	return nil
 }
 
 // Result is a non-blocking RPC from the worker that sends the solution to some previous pow instance assignment
 // back to the Coordinator
 func (c *CoordRPCHandler) Result(args CoordResultArgs, reply *struct{}) error {
-	if args.Secret != nil {
-		c.tracer.RecordAction(CoordinatorWorkerResult{
+	trace := c.tracer.ReceiveToken(args.RetToken)
+	if args.Secret != "" {
+		trace.RecordAction(CoordinatorWorkerResult{
 			Nonce:            args.Nonce,
 			NumTrailingZeros: args.NumTrailingZeros,
 			WorkerByte:       args.WorkerByte,
