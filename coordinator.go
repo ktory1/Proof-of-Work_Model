@@ -1,6 +1,8 @@
 package distpow
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -43,7 +45,7 @@ type CoordinatorWorkerResult struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
 	WorkerByte       uint8
-	Secret           string
+	Secret           []uint8
 }
 
 type CoordinatorWorkerCancel struct {
@@ -55,13 +57,14 @@ type CoordinatorWorkerCancel struct {
 type CoordinatorSuccess struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
-	Secret           string
+	Secret           []uint8
 }
 
 type Coordinator struct {
 	config  CoordinatorConfig
 	tracer  *tracing.Tracer
 	workers []*WorkerClient
+	cache   CoordCache
 }
 
 /****** RPC structs ******/
@@ -84,17 +87,33 @@ type CoordResultArgs struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
 	WorkerByte       uint8
-	Secret           string
+	Secret           []uint8
 	RetToken         tracing.TracingToken
 }
 
-type ResultChan chan CoordResultArgs
+type CacheKey struct {
+	n string
+	t uint
+}
+
+type CoordCache struct {
+	mu    sync.Mutex
+	cache map[CacheKey][]uint8
+}
+
+type ResultChan chan ResultChanItem
+
+type ResultChanItem struct {
+	args  CoordResultArgs
+	trace *tracing.Trace
+}
 
 type CoordRPCHandler struct {
 	tracer     *tracing.Tracer
 	workers    []*WorkerClient
 	workerBits uint
 	mineTasks  CoordinatorMineTasks
+	coordCache CoordCache
 }
 
 type CoordinatorMineTasks struct {
@@ -122,6 +141,9 @@ func NewCoordinator(config CoordinatorConfig) *Coordinator {
 		config:  config,
 		tracer:  tracer,
 		workers: workerClients,
+		cache: CoordCache{
+			cache: make(map[CacheKey][]uint8),
+		},
 	}
 }
 
@@ -132,6 +154,37 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 		NumTrailingZeros: args.MineArgs.NumTrailingZeros,
 		Nonce:            args.MineArgs.Nonce,
 	})
+	mineKey := CacheKey{
+		n: base64.StdEncoding.EncodeToString(args.MineArgs.Nonce),
+		t: args.MineArgs.NumTrailingZeros,
+	}
+
+	for key, element := range c.coordCache.cache {
+		if key.n == mineKey.n && key.t >= mineKey.t {
+			trace.RecordAction(CacheHit{
+				Nonce:            []uint8(mineKey.n),
+				NumTrailingZeros: mineKey.t,
+				Secret:           element,
+			})
+
+			// delete completed mine task from map
+			c.mineTasks.delete(args.MineArgs.Nonce, args.MineArgs.NumTrailingZeros)
+
+			reply.MineRes.NumTrailingZeros = mineKey.t
+			reply.MineRes.Nonce = []uint8(mineKey.n)
+			reply.MineRes.Secret = element
+
+			trace.RecordAction(reply.MineRes)
+
+			reply.RetToken = trace.GenerateToken()
+			return nil
+		}
+	}
+
+	trace.RecordAction(CacheMiss{
+		Nonce:            args.MineArgs.Nonce,
+		NumTrailingZeros: args.MineArgs.NumTrailingZeros,
+	})
 
 	// initialize and connect to workers (if not already connected)
 	for err := initializeWorkers(c.workers); err != nil; {
@@ -141,7 +194,7 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 
 	workerCount := len(c.workers)
 
-	resultChan := make(chan CoordResultArgs, workerCount)
+	resultChan := make(chan ResultChanItem, workerCount)
 	c.mineTasks.set(args.MineArgs.Nonce, args.MineArgs.NumTrailingZeros, resultChan)
 
 	for _, w := range c.workers {
@@ -170,15 +223,15 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 	// wait for at least one result
 	result := <-resultChan
 	// sanity check
-	if result.Secret == "" {
-		log.Fatalf("First worker result appears to be cancellation ACK, from workerByte = %d", result.WorkerByte)
+	if result.args.Secret == nil {
+		log.Fatalf("First worker result appears to be cancellation ACK, from workerByte = %d", result.args.WorkerByte)
 	}
 
 	// after receiving one result, cancel all workers unconditionally.
 	// the cancellation takes place of an ACK for any workers sending results.
 	for _, w := range c.workers {
-		if w.workerByte != result.WorkerByte {
-			trace.RecordAction(CoordinatorWorkerCancel{
+		if w.workerByte != result.args.WorkerByte {
+			result.trace.RecordAction(CoordinatorWorkerCancel{
 				Nonce:            args.MineArgs.Nonce,
 				NumTrailingZeros: args.MineArgs.NumTrailingZeros,
 				WorkerByte:       w.workerByte,
@@ -188,7 +241,8 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 			Nonce:            args.MineArgs.Nonce,
 			NumTrailingZeros: args.MineArgs.NumTrailingZeros,
 			WorkerByte:       w.workerByte,
-			Token:            trace.GenerateToken(),
+			Token:            result.trace.GenerateToken(),
+			Secret:           result.args.Secret,
 		}
 		err := w.client.Call("WorkerRPCHandler.Found", args, &struct{}{})
 		if err != nil {
@@ -200,23 +254,52 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 
 	// wait for all all workers to send back cancel ACK, ignoring results (receiving them is logged, but they have no further use here)
 	// we asked all workers to cancel, so we should get exactly workerCount ACKs.
-	workerAcksReceived := 0
+	workerAcksReceived := 1
 	for workerAcksReceived < workerCount {
 		ack := <-resultChan
-		if ack.Secret == "" {
+		if ack.args.Secret == nil {
 			log.Printf("Counting toward acks: %v", ack)
 			workerAcksReceived += 1
 		} else {
-			log.Printf("Dropping extra result: %v", ack)
+			workerAcksReceived += 1
+			if bytes.Compare(result.args.Secret, ack.args.Secret) < 0 {
+				c.coordCache.cacheRemove(result.args.NumTrailingZeros, base64.StdEncoding.EncodeToString(result.args.Nonce))
+				trace.RecordAction(CacheRemove{
+					Nonce:            result.args.Nonce,
+					NumTrailingZeros: result.args.NumTrailingZeros,
+					Secret:           result.args.Secret,
+				})
+
+				c.coordCache.cacheAdd(ack.args.NumTrailingZeros, base64.StdEncoding.EncodeToString(ack.args.Nonce), ack.args.Secret)
+
+				trace.RecordAction(CacheAdd{
+					Nonce:            ack.args.Nonce,
+					NumTrailingZeros: ack.args.NumTrailingZeros,
+					Secret:           ack.args.Secret,
+				})
+			}
+			for _, w := range c.workers {
+				args := WorkerCancelArgs{
+					Nonce:            args.MineArgs.Nonce,
+					NumTrailingZeros: args.MineArgs.NumTrailingZeros,
+					WorkerByte:       w.workerByte,
+					Token:            ack.trace.GenerateToken(),
+					Secret:           result.args.Secret,
+				}
+				err := w.client.Call("WorkerRPCHandler.Found", args, &struct{}{})
+				if err != nil {
+					return err
+				}
+			}
 		}
 	}
 
 	// delete completed mine task from map
 	c.mineTasks.delete(args.MineArgs.Nonce, args.MineArgs.NumTrailingZeros)
 
-	reply.MineRes.NumTrailingZeros = result.NumTrailingZeros
-	reply.MineRes.Nonce = result.Nonce
-	reply.MineRes.Secret = result.Secret
+	reply.MineRes.NumTrailingZeros = result.args.NumTrailingZeros
+	reply.MineRes.Nonce = result.args.Nonce
+	reply.MineRes.Secret = result.args.Secret
 
 	trace.RecordAction(reply.MineRes)
 
@@ -228,17 +311,39 @@ func (c *CoordRPCHandler) Mine(args CoordMineArgs, reply *CoordMineResponse) err
 // back to the Coordinator
 func (c *CoordRPCHandler) Result(args CoordResultArgs, reply *struct{}) error {
 	trace := c.tracer.ReceiveToken(args.RetToken)
-	if args.Secret != "" {
+	if args.Secret != nil {
 		trace.RecordAction(CoordinatorWorkerResult{
 			Nonce:            args.Nonce,
 			NumTrailingZeros: args.NumTrailingZeros,
 			WorkerByte:       args.WorkerByte,
 			Secret:           args.Secret,
 		})
+
+		for key, element := range c.coordCache.cache {
+			if key.n == base64.StdEncoding.EncodeToString(args.Nonce) && (key.t < args.NumTrailingZeros ||
+				(key.t == args.NumTrailingZeros && bytes.Compare(args.Secret, element) > 0)) {
+				c.coordCache.cacheRemove(key.t, key.n)
+				trace.RecordAction(CacheRemove{
+					Nonce:            []uint8(key.n),
+					NumTrailingZeros: key.t,
+					Secret:           element,
+				})
+				break
+			}
+		}
+
+		c.coordCache.cacheAdd(args.NumTrailingZeros, base64.StdEncoding.EncodeToString(args.Nonce), args.Secret)
+
+		trace.RecordAction(CacheAdd{
+			Nonce:            args.Nonce,
+			NumTrailingZeros: args.NumTrailingZeros,
+			Secret:           args.Secret,
+		})
+
 	} else {
 		log.Printf("Received worker cancel ack: %v", args)
 	}
-	c.mineTasks.get(args.Nonce, args.NumTrailingZeros) <- args
+	c.mineTasks.get(args.Nonce, args.NumTrailingZeros) <- ResultChanItem{args, trace}
 	return nil
 }
 
@@ -250,6 +355,7 @@ func (c *Coordinator) InitializeRPCs() error {
 		mineTasks: CoordinatorMineTasks{
 			tasks: make(map[string]ResultChan),
 		},
+		coordCache: c.cache,
 	}
 	server := rpc.NewServer()
 	err := server.Register(handler) // publish Coordinator<->worker procs
@@ -285,6 +391,24 @@ func initializeWorkers(workers []*WorkerClient) error {
 		}
 	}
 	return nil
+}
+
+func (t *CoordCache) cacheAdd(numZeros uint, nonce string, secret []uint8) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cache[CacheKey{
+		n: nonce,
+		t: numZeros,
+	}] = secret
+}
+
+func (t *CoordCache) cacheRemove(numZeros uint, nonce string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.cache, CacheKey{
+		n: nonce,
+		t: numZeros,
+	})
 }
 
 func (t *CoordinatorMineTasks) get(nonce []uint8, numTrailingZeros uint) ResultChan {

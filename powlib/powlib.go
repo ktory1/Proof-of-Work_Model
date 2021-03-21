@@ -23,20 +23,20 @@ type PowlibMine struct {
 type PowlibSuccess struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
-	Secret           string
+	Secret           []uint8
 }
 
 type PowlibMiningComplete struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
-	Secret           string
+	Secret           []uint8
 }
 
 // MineResult contains the result of a mining request.
 type MineResult struct {
 	Nonce            []uint8
 	NumTrailingZeros uint
-	Secret           string
+	Secret           []uint8
 }
 
 // NotifyChannel is used for notifying the client about a mining result.
