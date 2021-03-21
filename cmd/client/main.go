@@ -35,27 +35,22 @@ func main() {
 	defer client.Close()
 	defer client2.Close()
 
-	//a := []uint8{1, 2, 3, 4}
-	//b := []uint8{5, 6, 7, 8}
-	//c := []uint8{2, 2, 2, 2}
-	//log.Println(base64.StdEncoding.EncodeToString(a))
-	//log.Println(base64.StdEncoding.EncodeToString(b))
-	//log.Println(base64.StdEncoding.EncodeToString(c))
-
 	if err := client.Mine([]uint8{1, 2, 3, 4}, 7); err != nil {
 		log.Println(err)
 	}
 	if err := client.Mine([]uint8{5, 6, 7, 8}, 5); err != nil {
 		log.Println(err)
 	}
-	//if err := client2.Mine([]uint8{2, 2, 2, 2}, 5); err != nil {
-	//	log.Println(err)
-	//}
-	//if err := client2.Mine([]uint8{2, 2, 2, 2}, 7); err != nil {
-	//	log.Println(err)
-	//}
 
-	for i := 0; i < 2; i++ {
+	if err := client2.Mine([]uint8{2, 2, 2, 2}, 7); err != nil {
+		log.Println(err)
+	}
+
+	if err := client2.Mine([]uint8{2, 2, 2, 2}, 5); err != nil {
+		log.Println(err)
+	}
+
+	for i := 0; i < 4; i++ {
 		select {
 		case mineResult := <-client.NotifyChannel:
 			log.Println(mineResult)

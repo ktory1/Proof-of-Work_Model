@@ -360,29 +360,6 @@ func miner(w *WorkerRPCHandler, trace *tracing.Trace, args WorkerMineArgs, killC
 				w.resultChan <- result
 
 				return
-				//// now, wait for the worker the receive a cancellation,
-				//// which the coordinator should always send no matter what.
-				//// note: this position takes care of interleavings where cancellation comes after we check killChan but
-				////       before we log the result we found, forcing WorkerCancel to be the last action logged, even in that case.
-				//<-killChan
-				//
-				//// and log it, which satisfies the (optional) stricter interpretation of WorkerCancel
-				////trace.RecordAction(WorkerCancel{
-				////	Nonce:            args.Nonce,
-				////	NumTrailingZeros: args.NumTrailingZeros,
-				////	WorkerByte:       args.WorkerByte,
-				////})
-				//// ACK the cancellation; the coordinator will be waiting for this.
-				//w.resultChan <- WorkerReply{
-				//	Result: WorkerResult{
-				//		Nonce:            args.Nonce,
-				//		NumTrailingZeros: args.NumTrailingZeros,
-				//		WorkerByte:       args.WorkerByte,
-				//		Secret:           "",
-				//	},
-				//	RetToken: trace.GenerateToken(),
-				//}
-				//return
 			}
 		}
 		chunk = nextChunk(chunk)
